@@ -26,7 +26,8 @@ def generate_synthetic_prices(T=300, seed=0):
     p1 = base + np.random.normal(0, 0.1, size=T)
     p2 = 2.0 * base + np.random.normal(0, 0.2, size=T)
     p3 = 0.5 * base + np.random.normal(0, 0.15, size=T)
-    df = pd.DataFrame({'Brent': p1, 'Shanghai': p2, 'WTI': p3})
+    dates = pd.date_range(end=pd.Timestamp.today(), periods=T, freq='D')
+    df = pd.DataFrame({'Brent': p1, 'Shanghai': p2, 'WTI': p3}, index=dates)
     return df
 
 
@@ -70,7 +71,7 @@ def main(metrics=False, outdir='artifacts', prices_path=None):
             if 'Brent' not in df.columns or 'WTI' not in df.columns:
                 raise ValueError('Missing Brent or WTI columns')
 
-            prices = pd.DataFrame({'Brent': df['Brent'].values, 'Shanghai': sh.values, 'WTI': df['WTI'].values})
+            prices = pd.DataFrame({'Brent': df['Brent'].values, 'Shanghai': sh.values, 'WTI': df['WTI'].values}, index=df['date'])
             print(f"Loaded prices from {prices_path}")
         except Exception as e:
             print(f"Failed to load prices from {prices_path}: {e}. Falling back to synthetic data.")
@@ -95,13 +96,26 @@ def main(metrics=False, outdir='artifacts', prices_path=None):
         try:
             signals, spread = model.run_backtest(strat, prices)
         except Exception as e:
-            results[strat] = {'error': str(e)}
-            print(f"{strat}: error {e}")
+            import traceback
+            traceback.print_exc()
+            results[strat] = {'error': repr(e)}
+            print(f"{strat}: error {repr(e)}")
             continue
 
         if metrics:
             # evaluate_performance needs lambda_vec and lambda_0 set by fit_cointegration
             rets = evaluate_performance(signals, prices, model.lambda_vec, model.lambda_0)
+            # ensure returns get a datetime index when prices have one
+            try:
+                if isinstance(prices.index, pd.DatetimeIndex):
+                    rets = pd.Series(rets)
+                    if len(prices.index) >= len(rets) + 1:
+                        rets.index = prices.index[1:1+len(rets)]
+                    elif len(prices.index) == len(rets):
+                        rets.index = prices.index
+            except Exception:
+                rets = pd.Series(rets)
+
             summary = summarize_returns(rets)
             # add trade-level stats
             trades = sum(1 for i in range(1, len(signals)) if signals[i] != signals[i-1])
@@ -109,10 +123,16 @@ def main(metrics=False, outdir='artifacts', prices_path=None):
             win_rate = int(wins) / len(rets) if len(rets) > 0 else None
             summary.update({'total_trades': int(trades), 'win_rate': win_rate})
 
-            # save daily returns
+            # save daily returns (preserve datetime index when available)
             rets.to_csv(out / f"rets_{strat}.csv", index=True)
-            # save spread
-            pd.Series(spread).to_csv(out / f"spread_{strat}.csv", index=True)
+            # save spread and preserve dates if prices index exists
+            spread_series = pd.Series(spread)
+            try:
+                if isinstance(prices.index, pd.DatetimeIndex) and len(prices.index) >= len(spread_series):
+                    spread_series.index = prices.index[:len(spread_series)]
+            except Exception:
+                pass
+            spread_series.to_csv(out / f"spread_{strat}.csv", index=True)
 
         # If requested, save gross returns and per-trade tables using existing helper scripts
         if do_gross:

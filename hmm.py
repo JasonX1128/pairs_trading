@@ -162,6 +162,14 @@ class CrudeOilArbitrageHMM:
     def run_backtest(self, strategy, df_prices):
         """The main loop: Cointegration -> Initialize -> Filter -> Trade -> M-Step."""
         spread = self.fit_cointegration(df_prices)
+        # Ensure positional integer indexing for internal numeric loops.
+        # If spread has a non-integer index (e.g., datetimes), reset to RangeIndex.
+        try:
+            if hasattr(spread, 'index') and not isinstance(spread.index, pd.RangeIndex):
+                spread = spread.reset_index(drop=True)
+        except Exception:
+            # fallback: coerce to plain numpy-backed Series
+            spread = pd.Series(np.asarray(spread))
         self.initialize_params(spread)
         
         T = len(spread)

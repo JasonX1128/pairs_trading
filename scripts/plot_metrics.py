@@ -13,6 +13,7 @@ from pathlib import Path
 import pandas as pd
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mtick
+import matplotlib.dates as mdates
 import numpy as np
 import seaborn as sns
 
@@ -23,29 +24,34 @@ FIGS.mkdir(parents=True, exist_ok=True)
 
 
 def load_series(path):
-    s = pd.read_csv(path, index_col=0, header=None, squeeze=True)
-    s.index = pd.to_datetime(s.index, errors='ignore')
+    s = pd.read_csv(path, index_col=0, header=0, parse_dates=True).iloc[:, 0]
     return s
 
 
 def plot_equity(ret_series, outpath, title):
+    if ret_series.empty:
+        return
+
     eq = (1 + ret_series).cumprod()
-    plt.figure(figsize=(8,4))
-    sns.lineplot(x=eq.index, y=eq.values)
-    plt.title(title)
-    plt.ylabel('Equity (gross)')
-    # show y-axis as percent change from start for easier comparison
     start = eq.iloc[0] if len(eq) > 0 else 1.0
     rel = (eq / start - 1) * 100
-    plt.gca().yaxis.set_major_formatter(mtick.PercentFormatter())
-    # replace plotted line with percent-relative values for clearer scaling
-    plt.clf()
-    plt.figure(figsize=(8,4))
-    sns.lineplot(x=rel.index, y=rel.values)
-    plt.title(title)
+
+    plt.figure(figsize=(10, 5))
+    sns.lineplot(x=rel.index, y=rel.values, color='#2b83ba')
+    plt.title(title, fontweight='bold')
     plt.ylabel('Cumulative return (%)')
+    plt.xlabel('Date')
+    plt.gca().yaxis.set_major_formatter(mtick.PercentFormatter())
+    # format x-axis as dates
+    try:
+        plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator())
+        plt.gca().xaxis.set_major_formatter(mdates.ConciseDateFormatter(mdates.AutoDateLocator()))
+    except Exception:
+        pass
+    plt.xticks(rotation=45)
+    plt.grid(True, alpha=0.25)
     plt.tight_layout()
-    plt.savefig(outpath)
+    plt.savefig(outpath, dpi=300)
     plt.close()
 
 
@@ -96,17 +102,32 @@ def plot_trades_pnl(trades_df, outpath, title):
 
 
 def plot_spread_with_trades(spread_series, trades_df, outpath, title):
-    plt.figure(figsize=(10,4))
-    plt.plot(spread_series.index, spread_series.values, label='spread')
+    if spread_series.empty:
+        return
+    plt.figure(figsize=(12,5))
+    plt.plot(spread_series.index, spread_series.values, label='HMM Spread', color='black', alpha=0.6)
     if not trades_df.empty:
         for _, r in trades_df.iterrows():
-            entry = int(r['entry'])
-            exit = int(r['exit'])
-            plt.axvline(spread_series.index[entry], color='g', alpha=0.6)
-            plt.axvline(spread_series.index[exit], color='r', alpha=0.6)
-    plt.title(title)
+            try:
+                entry = int(r['entry'])
+                exit = int(r['exit'])
+                entry_dt = spread_series.index[entry]
+                exit_dt = spread_series.index[exit]
+                plt.axvspan(entry_dt, exit_dt, color='green' if r.get('pnl', 0) > 0 else 'red', alpha=0.2)
+            except Exception:
+                continue
+    plt.title(title, fontweight='bold')
+    plt.xlabel('Date')
+    plt.ylabel('Spread')
+    try:
+        plt.gca().xaxis.set_major_locator(mdates.AutoDateLocator())
+        plt.gca().xaxis.set_major_formatter(mdates.ConciseDateFormatter(mdates.AutoDateLocator()))
+    except Exception:
+        pass
+    plt.xticks(rotation=45)
+    plt.legend()
     plt.tight_layout()
-    plt.savefig(outpath)
+    plt.savefig(outpath, dpi=300)
     plt.close()
 
 
@@ -117,28 +138,27 @@ def main():
     strategies = list(metrics.keys())
 
     for strat in strategies:
-        # net returns
+        # paths: these CSVs should have a datetime index saved
         net_path = ART / f"rets_{strat}.csv"
         gross_path = ART / f"rets_gross_{strat}.csv"
         trades_path = ART / f"trades_{strat}.csv"
         spread_path = ART / f"spread_{strat}.csv"
 
         if net_path.exists():
-            net = pd.read_csv(net_path, index_col=0, header=0).iloc[:, 0]
+            net = pd.read_csv(net_path, index_col=0, header=0, parse_dates=True).iloc[:, 0]
         else:
             net = pd.Series(dtype=float)
 
         if gross_path.exists():
-            gross = pd.read_csv(gross_path, index_col=0, header=0).iloc[:, 0]
+            gross = pd.read_csv(gross_path, index_col=0, header=0, parse_dates=True).iloc[:, 0]
         else:
             gross = pd.Series(dtype=float)
 
         trades_df = pd.read_csv(trades_path) if trades_path.exists() else pd.DataFrame()
 
-        # spread
+        # spread (keep original dates if present)
         if spread_path.exists():
-            spread = pd.read_csv(spread_path, index_col=0, header=None).iloc[:, 0]
-            spread.index = pd.RangeIndex(start=0, stop=len(spread))
+            spread = pd.read_csv(spread_path, index_col=0, header=0, parse_dates=True).iloc[:, 0]
         else:
             spread = pd.Series(dtype=float)
 
