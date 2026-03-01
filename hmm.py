@@ -43,8 +43,8 @@ class CrudeOilArbitrageHMM:
 
     def initialize_params(self, spread_init):
         """OLS initialization using the first 20 trading days."""
-        y = spread_init[1:21].values
-        x = spread_init[0:20].values
+        y = spread_init.iloc[1:21].values
+        x = spread_init.iloc[0:20].values
         X = np.column_stack([np.ones(len(x)), x])
         beta = np.linalg.lstsq(X, y, rcond=None)[0]
         
@@ -123,7 +123,7 @@ class CrudeOilArbitrageHMM:
 
     def get_signal(self, strategy, t, spread, x_hat):
         """Implementation of the 5 trading strategy signals."""
-        s_curr, s_prev = spread[t], spread[t-1]
+        s_curr, s_prev = spread.iloc[t], spread.iloc[t-1]
         q = abs(norm.ppf(self.alpha_bw / 2))
         
         if strategy == 'PV':
@@ -144,7 +144,7 @@ class CrudeOilArbitrageHMM:
             
         elif strategy == 'RI':
             x_t = (s_curr / s_prev) - 1
-            hist_inc = np.abs((spread[1:t].values / spread[:t-1].values) - 1)
+            hist_inc = np.abs((spread.iloc[1:t].values / spread.iloc[:t-1].values) - 1)
             q_val = np.percentile(hist_inc, 100 * (1 - self.alpha_bw)) if len(hist_inc) > 10 else 999
             if x_t > q_val: return -1
             if x_t < -q_val: return 1
@@ -152,7 +152,7 @@ class CrudeOilArbitrageHMM:
         elif strategy == 'PI':
             e_next = np.dot(x_hat, self.gamma + self.phi * s_curr)
             pred_inc = (e_next / s_curr) - 1
-            hist_inc = np.abs((spread[1:t].values / spread[:t-1].values) - 1)
+            hist_inc = np.abs((spread.iloc[1:t].values / spread.iloc[:t-1].values) - 1)
             q_val = np.percentile(hist_inc, 100 * (1 - self.alpha_bw)) if len(hist_inc) > 10 else 999
             if pred_inc > q_val: return -1
             if pred_inc < -q_val: return 1
@@ -161,15 +161,8 @@ class CrudeOilArbitrageHMM:
 
     def run_backtest(self, strategy, df_prices):
         """The main loop: Cointegration -> Initialize -> Filter -> Trade -> M-Step."""
+        # compute spread (keep original index) and use .iloc for positional access
         spread = self.fit_cointegration(df_prices)
-        # Ensure positional integer indexing for internal numeric loops.
-        # If spread has a non-integer index (e.g., datetimes), reset to RangeIndex.
-        try:
-            if hasattr(spread, 'index') and not isinstance(spread.index, pd.RangeIndex):
-                spread = spread.reset_index(drop=True)
-        except Exception:
-            # fallback: coerce to plain numpy-backed Series
-            spread = pd.Series(np.asarray(spread))
         self.initialize_params(spread)
         
         T = len(spread)
@@ -179,7 +172,7 @@ class CrudeOilArbitrageHMM:
         
         for t in range(1, T):
             # 1. Update Filter (E-Step)
-            x_hat = self._e_step(spread[t], spread[t-1], x_hat)
+            x_hat = self._e_step(spread.iloc[t], spread.iloc[t-1], x_hat)
             
             # 2. Update Parameters every m steps (M-Step)
             if t % self.m == 0:
@@ -188,7 +181,7 @@ class CrudeOilArbitrageHMM:
             # 3. Generate Trading Signal
             if position == 0:
                 position = self.get_signal(strategy, t, spread, x_hat)
-            elif (position == 1 and spread[t] >= 0) or (position == -1 and spread[t] <= 0):
+            elif (position == 1 and spread.iloc[t] >= 0) or (position == -1 and spread.iloc[t] <= 0):
                 position = 0
             
             signals.append(position)
