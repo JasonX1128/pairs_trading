@@ -123,9 +123,11 @@ class CrudeOilArbitrageHMM:
                 self.eta[i] = np.sqrt(np.abs(resid_sq / self.T_count[i]))
 
     def get_signal(self, strategy, t, spread, x_hat):
-        """Implementation of the 5 trading strategy signals."""
         s_curr, s_prev = spread.iloc[t], spread.iloc[t-1]
         q = abs(norm.ppf(self.alpha_bw / 2))
+        
+        # Use a rolling window for historical increments to avoid permanently inflated thresholds
+        lookback = min(t, 100) # 100-day rolling window
         
         if strategy == 'PV':
             return -1 if s_curr > 0 else 1
@@ -139,15 +141,18 @@ class CrudeOilArbitrageHMM:
             
         elif strategy == 'PredI':
             e_s = np.dot(x_hat, self.gamma + self.phi * s_prev)
-            std_s = np.sqrt(np.dot(x_hat, self.eta**2))
-            if s_curr > (e_s + q * std_s): return 1
-            if s_curr < (e_s - q * std_s): return -1
+            # Safeguard: Blend HMM volatility with empirical volatility to prevent infinite bands
+            empirical_std = np.std(spread.iloc[t-lookback:t]) if t > 10 else 0
+            std_s = min(np.sqrt(np.dot(x_hat, self.eta**2)), empirical_std * 2) 
+            
+            if s_curr > (e_s + q * std_s): return -1
+            if s_curr < (e_s - q * std_s): return 1
             
         elif strategy == 'RI':
             if t < 2: return 0
-            # Removed division to prevent explosion on mean-zero spread crossings
             x_t = s_curr - s_prev
-            hist_inc = np.abs(spread.iloc[1:t].values - spread.iloc[:t-1].values)
+            # Rolling window for percentiles
+            hist_inc = np.abs(spread.iloc[t-lookback+1:t].values - spread.iloc[t-lookback:t-1].values)
             q_val = np.percentile(hist_inc, 100 * (1 - self.alpha_bw)) if len(hist_inc) > 10 else 999
             if x_t > q_val: return -1
             if x_t < -q_val: return 1
@@ -155,12 +160,14 @@ class CrudeOilArbitrageHMM:
         elif strategy == 'PI':
             if t < 1: return 0
             e_next = np.dot(x_hat, self.gamma + self.phi * s_curr)
-            # Removed division to prevent explosion on mean-zero spread crossings
             pred_inc = e_next - s_curr
-            hist_inc = np.abs(spread.iloc[1:t].values - spread.iloc[:t-1].values)
+            # Rolling window for percentiles
+            hist_inc = np.abs(spread.iloc[t-lookback+1:t].values - spread.iloc[t-lookback:t-1].values)
             q_val = np.percentile(hist_inc, 100 * (1 - self.alpha_bw)) if len(hist_inc) > 10 else 999
-            if pred_inc > q_val: return -1
-            if pred_inc < -q_val: return 1
+            
+            # FIXED LOGIC: Buy when predicting an increase, sell when predicting a decrease
+            if pred_inc > q_val: return 1   
+            if pred_inc < -q_val: return -1 
             
         return 0
 
