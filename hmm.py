@@ -90,7 +90,6 @@ class CrudeOilArbitrageHMM:
         else:
             x_next = x_next / np.sum(x_next)
         
-        # Accumulate trackers for the M-step
         # Accumulate trackers for the M-step (only finite values)
         x_next_for_accum = np.nan_to_num(x_next, nan=0.0, posinf=0.0, neginf=0.0)
         self.T_count += x_next_for_accum
@@ -113,13 +112,15 @@ class CrudeOilArbitrageHMM:
         # Update Regime Parameters (Weighted OLS)
         for i in range(self.N):
             denom = (self.T_count[i] * self.T_S2_prev[i] - self.T_S_prev[i]**2)
-            self.phi[i] = (self.T_count[i] * self.T_SS_prev[i] - self.T_S[i] * self.T_S_prev[i]) / denom
-            self.gamma[i] = (self.T_S[i] - self.phi[i] * self.T_S_prev[i]) / self.T_count[i]
-            
-            resid_sq = (self.T_S2[i] + (self.gamma[i]**2) * self.T_count[i] + (self.phi[i]**2) * self.T_S2_prev[i] - 
-                        2 * self.gamma[i] * self.T_S[i] - 2 * self.phi[i] * self.T_SS_prev[i] + 
-                        2 * self.gamma[i] * self.phi[i] * self.T_S_prev[i])
-            self.eta[i] = np.sqrt(np.abs(resid_sq / self.T_count[i]))
+            # Safeguard against zero denominator or insufficient data for OLS
+            if denom > 1e-8 and self.T_count[i] > 5:
+                self.phi[i] = (self.T_count[i] * self.T_SS_prev[i] - self.T_S[i] * self.T_S_prev[i]) / denom
+                self.gamma[i] = (self.T_S[i] - self.phi[i] * self.T_S_prev[i]) / self.T_count[i]
+                
+                resid_sq = (self.T_S2[i] + (self.gamma[i]**2) * self.T_count[i] + (self.phi[i]**2) * self.T_S2_prev[i] - 
+                            2 * self.gamma[i] * self.T_S[i] - 2 * self.phi[i] * self.T_SS_prev[i] + 
+                            2 * self.gamma[i] * self.phi[i] * self.T_S_prev[i])
+                self.eta[i] = np.sqrt(np.abs(resid_sq / self.T_count[i]))
 
     def get_signal(self, strategy, t, spread, x_hat):
         """Implementation of the 5 trading strategy signals."""
@@ -131,7 +132,7 @@ class CrudeOilArbitrageHMM:
             
         elif strategy == 'ProbI':
             if t < self.n: return 0
-            window = spread[t-self.n:t]
+            window = spread.iloc[t-self.n:t]
             mu, std = np.mean(window), np.std(window)
             if s_curr > (mu + q * std): return -1
             if s_curr < (mu - q * std): return 1
@@ -139,62 +140,93 @@ class CrudeOilArbitrageHMM:
         elif strategy == 'PredI':
             e_s = np.dot(x_hat, self.gamma + self.phi * s_prev)
             std_s = np.sqrt(np.dot(x_hat, self.eta**2))
-            if s_curr > (e_s + q * std_s): return -1
-            if s_curr < (e_s - q * std_s): return 1
+            if s_curr > (e_s + q * std_s): return 1
+            if s_curr < (e_s - q * std_s): return -1
             
         elif strategy == 'RI':
-            x_t = (s_curr / s_prev) - 1
-            hist_inc = np.abs((spread.iloc[1:t].values / spread.iloc[:t-1].values) - 1)
+            if t < 2: return 0
+            # Removed division to prevent explosion on mean-zero spread crossings
+            x_t = s_curr - s_prev
+            hist_inc = np.abs(spread.iloc[1:t].values - spread.iloc[:t-1].values)
             q_val = np.percentile(hist_inc, 100 * (1 - self.alpha_bw)) if len(hist_inc) > 10 else 999
             if x_t > q_val: return -1
             if x_t < -q_val: return 1
             
         elif strategy == 'PI':
+            if t < 1: return 0
             e_next = np.dot(x_hat, self.gamma + self.phi * s_curr)
-            pred_inc = (e_next / s_curr) - 1
-            hist_inc = np.abs((spread.iloc[1:t].values / spread.iloc[:t-1].values) - 1)
+            # Removed division to prevent explosion on mean-zero spread crossings
+            pred_inc = e_next - s_curr
+            hist_inc = np.abs(spread.iloc[1:t].values - spread.iloc[:t-1].values)
             q_val = np.percentile(hist_inc, 100 * (1 - self.alpha_bw)) if len(hist_inc) > 10 else 999
             if pred_inc > q_val: return -1
             if pred_inc < -q_val: return 1
             
         return 0
 
-    def run_backtest(self, strategy, df_prices):
+    def run_backtest(self, strategy, df_prices, window_size=100, warmup=20):
         """The main loop: Cointegration -> Initialize -> Filter -> Trade -> M-Step."""
-        # compute spread (keep original index) and use .iloc for positional access
-        spread = self.fit_cointegration(df_prices)
-        self.initialize_params(spread)
+        # Fit initial cointegration on the first 'window_size' data points to avoid lookahead
+        init_prices = df_prices.iloc[:max(window_size, warmup)]
+        self.fit_cointegration(init_prices)
         
-        T = len(spread)
+        # Initial spread for parameters
+        spread_init = pd.Series(np.dot(init_prices, self.lambda_vec) + self.lambda_0, index=init_prices.index)
+        self.initialize_params(spread_init)
+        
+        T = len(df_prices)
         signals = [0]
         position = 0
         x_hat = np.array([0.5, 0.5])
         
+        # Trackers
+        spread_series = pd.Series(index=df_prices.index, dtype=float)
+        spread_series.iloc[0] = np.dot(df_prices.iloc[0], self.lambda_vec) + self.lambda_0
+        lambda_history = [(self.lambda_vec.copy(), self.lambda_0)]
+        
         for t in range(1, T):
-            # 1. Update Filter (E-Step)
-            x_hat = self._e_step(spread.iloc[t], spread.iloc[t-1], x_hat)
+            # Rolling update: re-fit cointegration on the lookback window
+            if t >= window_size:
+                self.fit_cointegration(df_prices.iloc[t-window_size:t])
+            
+            # Recalculate current spread values using CURRENT rolling lambda
+            s_curr = np.dot(df_prices.iloc[t], self.lambda_vec) + self.lambda_0
+            s_prev = np.dot(df_prices.iloc[t-1], self.lambda_vec) + self.lambda_0
+            
+            spread_series.iloc[t] = s_curr
+            lambda_history.append((self.lambda_vec.copy(), self.lambda_0))
+
+            # 1. Update Filter (E-Step) using rolling values
+            x_hat = self._e_step(s_curr, s_prev, x_hat)
             
             # 2. Update Parameters every m steps (M-Step)
             if t % self.m == 0:
                 self._m_step()
             
-            # 3. Generate Trading Signal
-            if position == 0:
-                position = self.get_signal(strategy, t, spread, x_hat)
-            elif (position == 1 and spread.iloc[t] >= 0) or (position == -1 and spread.iloc[t] <= 0):
+            # 3. Generate Trading Signal (respecting warmup)
+            if t > warmup:
+                if position == 0:
+                    position = self.get_signal(strategy, t, spread_series, x_hat)
+                elif (position == 1 and s_curr >= 0) or (position == -1 and s_curr <= 0):
+                    position = 0
+            else:
                 position = 0
             
             signals.append(position)
             
-        return signals, spread
+        return signals, spread_series, lambda_history
 
-def evaluate_performance(signals, prices, lambda_vec, lambda_0):
+
+def evaluate_performance(signals, prices, lambda_history):
     """Calculates returns per unit of gross notional exposure."""
     # Transaction costs (bps): Brent 5.8, Shanghai 53.71, WTI 20.24
     costs = np.array([5.80, 53.71, 20.24]) / 10000
     daily_rets = []
     
     for t in range(1, len(signals)):
+        # Use lambda from t-1 to prevent lookahead in PnL calculation
+        lambda_vec, lambda_0 = lambda_history[t-1]
+        
         # Gross Exposure G_t-1
         g_t_prev = np.abs(lambda_0) + np.sum(np.abs(lambda_vec) * prices.iloc[t-1])
         
