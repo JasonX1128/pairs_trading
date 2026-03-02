@@ -30,18 +30,18 @@ class CrudeOilArbitrageHMM:
         self.J_tracker = np.zeros((self.N, self.N))
 
     def fit_cointegration(self, df, prev_lambda=None):
-        """Johansen test to find the long-term equilibrium spread with stability safeguards."""
+        """Johansen test to find the long-term equilibrium spread with strict economic safeguards."""
         res = coint_johansen(df, det_order=0, k_ar_diff=1)
         evec = res.evec[:, 0]
         
         # Prevent division by zero or near-zero
         if abs(evec[0]) < 1e-6:
-            new_lambda = evec # Fallback to unnormalized if Brent weight collapses
+            new_lambda = evec 
         else:
             new_lambda = evec / evec[0]
         
-        # Stability Check: Reject updates where any weight exceeds a magnitude of 20
-        if prev_lambda is not None and np.any(np.abs(new_lambda) > 20):
+        # STRICT ECONOMIC BOUND: Oil pairs should not require more than 3:1 leverage
+        if prev_lambda is not None and np.any(np.abs(new_lambda) > 3.0):
             self.lambda_vec = prev_lambda.copy()
         else:
             self.lambda_vec = new_lambda
@@ -69,30 +69,24 @@ class CrudeOilArbitrageHMM:
 
     def _e_step(self, s_curr, s_prev, x_hat):
         """Recursive filtering Equation 2.6 to update state probabilities."""
-        # Numerical guards: avoid division by zero / NaNs in densities
         eps = 1e-8
         eta_safe = np.where(self.eta <= 0, eps, self.eta)
 
         diff = s_curr - (self.gamma + self.phi * s_prev)
-        # exponent can underflow; clip to reasonable numeric range
         exponent = -0.5 * (diff**2) / (eta_safe**2)
         exponent = np.clip(exponent, -700, 700)
 
-        # Density components for each regime (Gaussian pdf)
         d = np.exp(exponent) / (eta_safe * np.sqrt(2 * np.pi))
 
-        # Filtered state probability
         x_next_unnorm = self.pi.T @ (d * x_hat)
         denom = np.sum(x_next_unnorm)
         if not np.isfinite(denom) or denom <= 0:
-            # fallback: keep previous belief or uniform if that is invalid
             x_next = x_hat.copy()
             if not np.all(np.isfinite(x_next)):
                 x_next = np.ones(self.N) / self.N
         else:
             x_next = x_next_unnorm / denom
 
-        # final safety: replace any NaN/inf and renormalize
         x_next = np.nan_to_num(x_next, nan=1.0/self.N, posinf=1.0/self.N, neginf=1.0/self.N)
         s = x_next.sum()
         if s <= 0 or not np.isfinite(s):
@@ -100,15 +94,17 @@ class CrudeOilArbitrageHMM:
         else:
             x_next = x_next / np.sum(x_next)
         
-        # Accumulate trackers for the M-step (only finite values)
         x_next_for_accum = np.nan_to_num(x_next, nan=0.0, posinf=0.0, neginf=0.0)
-        self.T_count += x_next_for_accum
-        self.T_S += x_next_for_accum * s_curr
-        self.T_S_prev += x_next_for_accum * s_prev
-        self.T_S2 += x_next_for_accum * (s_curr**2)
-        self.T_S2_prev += x_next_for_accum * (s_prev**2)
-        self.T_SS_prev += x_next_for_accum * (s_curr * s_prev)
-        self.J_tracker += np.outer(x_next_for_accum, x_hat) # Jump estimation
+        
+        # ADD FORGETTING FACTOR: Decay past history so the model remains dynamic
+        rho = 0.98 
+        self.T_count = rho * self.T_count + x_next_for_accum
+        self.T_S = rho * self.T_S + x_next_for_accum * s_curr
+        self.T_S_prev = rho * self.T_S_prev + x_next_for_accum * s_prev
+        self.T_S2 = rho * self.T_S2 + x_next_for_accum * (s_curr**2)
+        self.T_S2_prev = rho * self.T_S2_prev + x_next_for_accum * (s_prev**2)
+        self.T_SS_prev = rho * self.T_SS_prev + x_next_for_accum * (s_curr * s_prev)
+        self.J_tracker = rho * self.J_tracker + np.outer(x_next_for_accum, x_hat) 
         
         return x_next
 
@@ -135,6 +131,8 @@ class CrudeOilArbitrageHMM:
     def get_signal(self, strategy, t, spread, x_hat):
         s_curr, s_prev = spread.iloc[t], spread.iloc[t-1]
         q = abs(norm.ppf(self.alpha_bw / 2))
+        
+        # Use a rolling window for historical increments to avoid permanently inflated thresholds
         lookback = min(t, 100) # 100-day rolling window
         
         signal = 0
@@ -152,6 +150,7 @@ class CrudeOilArbitrageHMM:
             
         elif strategy == 'PredI':
             e_s = np.dot(x_hat, self.gamma + self.phi * s_prev)
+            # Safeguard: Blend HMM volatility with empirical volatility to prevent infinite bands
             empirical_std = np.std(spread.iloc[t-lookback:t]) if t > 10 else 0
             std_s = min(np.sqrt(np.dot(x_hat, self.eta**2)), empirical_std * 2) 
             
@@ -161,6 +160,7 @@ class CrudeOilArbitrageHMM:
         elif strategy == 'RI':
             if t >= 2:
                 x_t = s_curr - s_prev
+                # Rolling window for percentiles
                 hist_inc = np.abs(spread.iloc[t-lookback+1:t].values - spread.iloc[t-lookback:t-1].values)
                 q_val = np.percentile(hist_inc, 100 * (1 - self.alpha_bw)) if len(hist_inc) > 10 else 999
                 if x_t > q_val: signal = -1
@@ -170,14 +170,23 @@ class CrudeOilArbitrageHMM:
             if t >= 1:
                 e_next = np.dot(x_hat, self.gamma + self.phi * s_curr)
                 pred_inc = e_next - s_curr
-                hist_inc = np.abs(spread.iloc[t-lookback+1:t].values - spread.iloc[t-lookback:t-1].values)
-                q_val = np.percentile(hist_inc, 100 * (1 - self.alpha_bw)) if len(hist_inc) > 10 else 999
                 
-                # FIXED LOGIC: Buy when predicting an increase, sell when predicting a decrease
+                if t > 10:
+                    # Apply current HMM parameters to the historical lookback window 
+                    # to generate a distribution of historical predicted increments
+                    hist_s = spread.iloc[t-lookback:t].values
+                    e_next_hist = np.dot(x_hat, self.gamma[:, None] + self.phi[:, None] * hist_s[:-1])
+                    hist_pred_inc = np.abs(e_next_hist - hist_s[:-1])
+                    q_val = np.percentile(hist_pred_inc, 100 * (1 - self.alpha_bw))
+                else:
+                    q_val = 999
+                
+                # Buy when predicting an increase, sell when predicting a decrease
                 if pred_inc > q_val: signal = 1   
                 elif pred_inc < -q_val: signal = -1 
         
-        # STRICT WRONG-SIDE FILTER
+        # STRICT WRONG-SIDE FILTER: 
+        # Forbid Longs if spread is already positive. Forbid Shorts if spread is already negative.
         if signal == 1 and s_curr >= 0:
             return 0
         if signal == -1 and s_curr <= 0:
