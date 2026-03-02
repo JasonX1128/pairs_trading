@@ -94,7 +94,7 @@ def main(metrics=False, outdir='artifacts', prices_path=None):
         # instantiate a fresh model per strategy to avoid carry-over of online EM trackers
         model = CrudeOilArbitrageHMM()
         try:
-            signals, spread = model.run_backtest(strat, prices)
+            signals, spread, lambda_history = model.run_backtest(strat, prices)
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -104,7 +104,7 @@ def main(metrics=False, outdir='artifacts', prices_path=None):
 
         if metrics:
             # evaluate_performance needs lambda_vec and lambda_0 set by fit_cointegration
-            rets = evaluate_performance(signals, prices, model.lambda_vec, model.lambda_0)
+            rets = evaluate_performance(signals, prices, lambda_history)
             # ensure returns get a datetime index when prices have one
             try:
                 if isinstance(prices.index, pd.DatetimeIndex):
