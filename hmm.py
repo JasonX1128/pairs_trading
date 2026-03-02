@@ -4,7 +4,7 @@ from scipy.stats import norm
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
 
 class CrudeOilArbitrageHMM:
-    def __init__(self, n_states=2, bandwidth_alpha=0.20, batch_m=10, prob_i_window=20, fixed_hmm=True):
+    def __init__(self, n_states=2, bandwidth_alpha=0.20, batch_m=10, prob_i_window=20, fixed_hmm=False):
         self.N = n_states
         self.alpha_bw = bandwidth_alpha
         self.m = batch_m 
@@ -266,7 +266,7 @@ class CrudeOilArbitrageHMM:
         
         for t in range(1, T):
             if t >= window_size:
-                self.fit_cointegration(df_prices.iloc[t-window_size:t])
+                self.fit_cointegration(df_prices.iloc[t-window_size:t], prev_lambda=self.lambda_vec)
             
             s_curr = np.dot(df_prices.iloc[t], self.lambda_vec) + self.lambda_0
             s_prev = np.dot(df_prices.iloc[t-1], self.lambda_vec) + self.lambda_0
