@@ -82,8 +82,6 @@ def main(metrics=False, outdir='artifacts', prices_path=None):
     # Save selected prices for inspection
     prices.to_csv(out / 'prices.csv', index=True)
 
-    model = CrudeOilArbitrageHMM()
-
     strategies = ['PV', 'ProbI', 'PredI', 'RI', 'PI']
     results = {}
 
@@ -93,6 +91,8 @@ def main(metrics=False, outdir='artifacts', prices_path=None):
     do_plot = getattr(main, '_do_plot', False)
 
     for strat in strategies:
+        # instantiate a fresh model per strategy to avoid carry-over of online EM trackers
+        model = CrudeOilArbitrageHMM()
         try:
             signals, spread = model.run_backtest(strat, prices)
         except Exception as e:
