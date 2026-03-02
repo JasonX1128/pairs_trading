@@ -4,7 +4,7 @@ from scipy.stats import norm
 from statsmodels.tsa.vector_ar.vecm import coint_johansen
 
 class CrudeOilArbitrageHMM:
-    def __init__(self, n_states=2, bandwidth_alpha=0.20, batch_m=10, prob_i_window=20, fixed_hmm=False):
+    def __init__(self, n_states=2, bandwidth_alpha=0.20, batch_m=10, prob_i_window=20, fixed_hmm=True):
         self.N = n_states
         self.alpha_bw = bandwidth_alpha
         self.m = batch_m 
