@@ -29,12 +29,22 @@ class CrudeOilArbitrageHMM:
         self.T_SS_prev = np.zeros(self.N)
         self.J_tracker = np.zeros((self.N, self.N))
 
-    def fit_cointegration(self, df):
-        """Johansen test to find the long-term equilibrium spread."""
+    def fit_cointegration(self, df, prev_lambda=None):
+        """Johansen test to find the long-term equilibrium spread with stability safeguards."""
         res = coint_johansen(df, det_order=0, k_ar_diff=1)
-        # First eigenvector normalized to Brent (first column)
         evec = res.evec[:, 0]
-        self.lambda_vec = evec / evec[0]
+        
+        # Prevent division by zero or near-zero
+        if abs(evec[0]) < 1e-6:
+            new_lambda = evec # Fallback to unnormalized if Brent weight collapses
+        else:
+            new_lambda = evec / evec[0]
+        
+        # Stability Check: Reject updates where any weight exceeds a magnitude of 20
+        if prev_lambda is not None and np.any(np.abs(new_lambda) > 20):
+            self.lambda_vec = prev_lambda.copy()
+        else:
+            self.lambda_vec = new_lambda
         
         # Calculate lambda_0 (intercept) to mean-zero the spread
         raw_spread = df @ self.lambda_vec
@@ -194,8 +204,9 @@ class CrudeOilArbitrageHMM:
         x_hat_history = [x_hat.copy()]
         
         for t in range(1, T):
+            # Rolling update: re-fit cointegration on the lookback window
             if t >= window_size:
-                self.fit_cointegration(df_prices.iloc[t-window_size:t])
+                self.fit_cointegration(df_prices.iloc[t-window_size:t], prev_lambda=self.lambda_vec)
             
             s_curr = np.dot(df_prices.iloc[t], self.lambda_vec) + self.lambda_0
             s_prev = np.dot(df_prices.iloc[t-1], self.lambda_vec) + self.lambda_0
