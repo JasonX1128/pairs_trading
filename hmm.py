@@ -30,29 +30,27 @@ class CrudeOilArbitrageHMM:
         self.J_tracker = np.zeros((self.N, self.N))
 
     def fit_cointegration(self, df, prev_lambda=None):
-        """Johansen test to find the long-term equilibrium spread with strict economic safeguards."""
+        """Johansen test with max-weight normalization and sign-flip prevention."""
         res = coint_johansen(df, det_order=0, k_ar_diff=1)
         evec = res.evec[:, 0]
         
-        # Prevent division by zero or near-zero
-        if abs(evec[0]) < 1e-6:
-            new_lambda = evec 
-        else:
-            new_lambda = evec / evec[0]
+        # Max absolute weight normalization (preserves relative signs)
+        idx = np.argmax(np.abs(evec))
+        new_lambda = evec / np.abs(evec[idx])
         
-        # STRICT ECONOMIC BOUND: Oil pairs should not require more than 3:1 leverage
-        if prev_lambda is not None and np.any(np.abs(new_lambda) > 3.0):
-            self.lambda_vec = prev_lambda.copy()
-        else:
-            self.lambda_vec = new_lambda
-        
-        # Calculate lambda_0 (intercept) to mean-zero the spread
+        # SIGN ALIGNMENT: Prevent structural breaks by ensuring the vector 
+        # points in the same economic direction as yesterday
+        if prev_lambda is not None:
+            if np.dot(new_lambda, prev_lambda) < 0:
+                new_lambda = -new_lambda
+                
+        self.lambda_vec = new_lambda
         raw_spread = df @ self.lambda_vec
         self.lambda_0 = -np.mean(raw_spread)
         return raw_spread + self.lambda_0
 
     def initialize_params(self, spread_init):
-        """OLS initialization using the first 20 trading days."""
+        """OLS initialization with strong regime separation."""
         y = spread_init.iloc[1:21].values
         x = spread_init.iloc[0:20].values
         X = np.column_stack([np.ones(len(x)), x])
@@ -61,14 +59,14 @@ class CrudeOilArbitrageHMM:
         gamma_ols, phi_ols = beta[0], beta[1]
         eta_ols = np.std(y - (gamma_ols + phi_ols * x))
         
-        # Seed two regimes with different volatility/intercept levels
-        self.gamma = np.array([gamma_ols * 1.1, gamma_ols * 0.9])
+        # Force a strong initial distinction between High-Vol and Low-Vol states
+        self.gamma = np.array([gamma_ols + eta_ols, gamma_ols - eta_ols])
         self.phi = np.array([phi_ols, phi_ols])
-        self.eta = np.array([eta_ols * 1.2, eta_ols * 0.8])
-        self.pi = np.array([[0.9, 0.1], [0.1, 0.9]])
+        self.eta = np.array([eta_ols * 2.0, eta_ols * 0.5])
+        self.pi = np.array([[0.95, 0.05], [0.05, 0.95]])
 
     def _e_step(self, s_curr, s_prev, x_hat):
-        """Recursive filtering Equation 2.6 to update state probabilities."""
+        """Recursive filtering with a forgetting factor to maintain adaptability."""
         eps = 1e-8
         eta_safe = np.where(self.eta <= 0, eps, self.eta)
 
@@ -96,8 +94,8 @@ class CrudeOilArbitrageHMM:
         
         x_next_for_accum = np.nan_to_num(x_next, nan=0.0, posinf=0.0, neginf=0.0)
         
-        # ADD FORGETTING FACTOR: Decay past history so the model remains dynamic
-        rho = 0.98 
+        # RESTORE FORGETTING FACTOR: ~70 day half-life to keep the HMM dynamic
+        rho = 0.99 
         self.T_count = rho * self.T_count + x_next_for_accum
         self.T_S = rho * self.T_S + x_next_for_accum * s_curr
         self.T_S_prev = rho * self.T_S_prev + x_next_for_accum * s_prev
@@ -110,15 +108,11 @@ class CrudeOilArbitrageHMM:
 
     def _m_step(self):
         """Online EM Parameter Update Equation 2.7."""
-        # Update Transition Matrix
         self.pi = (self.J_tracker / self.T_count[:, None]).T
-        # Normalize rows to sum to 1
         self.pi = self.pi / self.pi.sum(axis=1)[:, None]
         
-        # Update Regime Parameters (Weighted OLS)
         for i in range(self.N):
             denom = (self.T_count[i] * self.T_S2_prev[i] - self.T_S_prev[i]**2)
-            # Safeguard against zero denominator or insufficient data for OLS
             if denom > 1e-8 and self.T_count[i] > 5:
                 self.phi[i] = (self.T_count[i] * self.T_SS_prev[i] - self.T_S[i] * self.T_S_prev[i]) / denom
                 self.gamma[i] = (self.T_S[i] - self.phi[i] * self.T_S_prev[i]) / self.T_count[i]
@@ -126,15 +120,15 @@ class CrudeOilArbitrageHMM:
                 resid_sq = (self.T_S2[i] + (self.gamma[i]**2) * self.T_count[i] + (self.phi[i]**2) * self.T_S2_prev[i] - 
                             2 * self.gamma[i] * self.T_S[i] - 2 * self.phi[i] * self.T_SS_prev[i] + 
                             2 * self.gamma[i] * self.phi[i] * self.T_S_prev[i])
+                
                 self.eta[i] = np.sqrt(np.abs(resid_sq / self.T_count[i]))
+                self.eta[i] = np.clip(self.eta[i], 0.001, 10.0)
 
     def get_signal(self, strategy, t, spread, x_hat):
         s_curr, s_prev = spread.iloc[t], spread.iloc[t-1]
         q = abs(norm.ppf(self.alpha_bw / 2))
         
-        # Use a rolling window for historical increments to avoid permanently inflated thresholds
-        lookback = min(t, 100) # 100-day rolling window
-        
+        lookback = min(t, 100) 
         signal = 0
         
         if strategy == 'PV':
@@ -150,7 +144,6 @@ class CrudeOilArbitrageHMM:
             
         elif strategy == 'PredI':
             e_s = np.dot(x_hat, self.gamma + self.phi * s_prev)
-            # Safeguard: Blend HMM volatility with empirical volatility to prevent infinite bands
             empirical_std = np.std(spread.iloc[t-lookback:t]) if t > 10 else 0
             std_s = min(np.sqrt(np.dot(x_hat, self.eta**2)), empirical_std * 2) 
             
@@ -160,7 +153,6 @@ class CrudeOilArbitrageHMM:
         elif strategy == 'RI':
             if t >= 2:
                 x_t = s_curr - s_prev
-                # Rolling window for percentiles
                 hist_inc = np.abs(spread.iloc[t-lookback+1:t].values - spread.iloc[t-lookback:t-1].values)
                 q_val = np.percentile(hist_inc, 100 * (1 - self.alpha_bw)) if len(hist_inc) > 10 else 999
                 if x_t > q_val: signal = -1
@@ -172,8 +164,6 @@ class CrudeOilArbitrageHMM:
                 pred_inc = e_next - s_curr
                 
                 if t > 10:
-                    # Apply current HMM parameters to the historical lookback window 
-                    # to generate a distribution of historical predicted increments
                     hist_s = spread.iloc[t-lookback:t].values
                     e_next_hist = np.dot(x_hat, self.gamma[:, None] + self.phi[:, None] * hist_s[:-1])
                     hist_pred_inc = np.abs(e_next_hist - hist_s[:-1])
@@ -181,21 +171,14 @@ class CrudeOilArbitrageHMM:
                 else:
                     q_val = 999
                 
-                # Buy when predicting an increase, sell when predicting a decrease
                 if pred_inc > q_val: signal = 1   
                 elif pred_inc < -q_val: signal = -1 
         
-        # STRICT WRONG-SIDE FILTER: 
-        # Forbid Longs if spread is already positive. Forbid Shorts if spread is already negative.
-        if signal == 1 and s_curr >= 0:
-            return 0
-        if signal == -1 and s_curr <= 0:
-            return 0
-            
+        if signal == 1 and s_curr >= 0: return 0
+        if signal == -1 and s_curr <= 0: return 0
         return signal
 
     def run_backtest(self, strategy, df_prices, window_size=100, warmup=20):
-        """The main loop: Cointegration -> Initialize -> Filter -> Trade -> M-Step."""
         init_prices = df_prices.iloc[:max(window_size, warmup)]
         self.fit_cointegration(init_prices)
         
@@ -213,9 +196,8 @@ class CrudeOilArbitrageHMM:
         x_hat_history = [x_hat.copy()]
         
         for t in range(1, T):
-            # Rolling update: re-fit cointegration on the lookback window
             if t >= window_size:
-                self.fit_cointegration(df_prices.iloc[t-window_size:t], prev_lambda=self.lambda_vec)
+                self.fit_cointegration(df_prices.iloc[t-window_size:t])
             
             s_curr = np.dot(df_prices.iloc[t], self.lambda_vec) + self.lambda_0
             s_prev = np.dot(df_prices.iloc[t-1], self.lambda_vec) + self.lambda_0
@@ -243,18 +225,15 @@ class CrudeOilArbitrageHMM:
 
 
 def evaluate_performance(signals, prices, lambda_history):
-    """Calculates returns per unit of gross notional exposure."""
     costs = np.array([5.80, 53.71, 20.24]) / 10000
     daily_rets = []
     
     for t in range(1, len(signals)):
         lambda_vec, lambda_0 = lambda_history[t-1]
-        
         g_t_prev = np.abs(lambda_0) + np.sum(np.abs(lambda_vec) * prices.iloc[t-1])
         p_delta = prices.iloc[t] - prices.iloc[t-1]
         pnl = signals[t-1] * np.sum(lambda_vec * p_delta)
         fee = np.sum(np.abs(signals[t] - signals[t-1]) * costs * prices.iloc[t] * np.abs(lambda_vec))
-        
         daily_rets.append((pnl - fee) / g_t_prev)
         
     return pd.Series(daily_rets)
