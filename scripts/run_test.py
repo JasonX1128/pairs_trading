@@ -17,19 +17,15 @@ sys.path.insert(0, str(PROJECT_ROOT))
 
 from hmm import CrudeOilArbitrageHMM, evaluate_performance
 
-
 def generate_synthetic_prices(T=300, seed=0):
     np.random.seed(seed)
-    # base random walk
     base = np.cumsum(np.random.normal(0, 0.5, size=T)) + 50
-    # create two other series that are roughly linear combinations (cointegrated)
     p1 = base + np.random.normal(0, 0.1, size=T)
     p2 = 2.0 * base + np.random.normal(0, 0.2, size=T)
     p3 = 0.5 * base + np.random.normal(0, 0.15, size=T)
     dates = pd.date_range(end=pd.Timestamp.today(), periods=T, freq='D')
     df = pd.DataFrame({'Brent': p1, 'Shanghai': p2, 'WTI': p3}, index=dates)
     return df
-
 
 def summarize_returns(ret_series):
     if ret_series.empty:
@@ -50,17 +46,14 @@ def summarize_returns(ret_series):
         'n_obs': int(len(ret_series)),
     }
 
-
 def main(metrics=False, outdir='artifacts', prices_path=None):
     out = Path(outdir)
     out.mkdir(parents=True, exist_ok=True)
 
-    # If a real prices CSV is provided, try to load and validate it. Otherwise generate synthetic prices.
     prices = None
     if prices_path:
         try:
             df = pd.read_csv(prices_path, parse_dates=['date'])
-            # Prefer Shanghai_USD if present, else convert Shanghai_CNY using USDCNY
             if 'Shanghai_USD' in df.columns:
                 sh = df['Shanghai_USD']
             elif 'Shanghai_CNY' in df.columns and 'USDCNY' in df.columns:
@@ -79,22 +72,19 @@ def main(metrics=False, outdir='artifacts', prices_path=None):
     if prices is None:
         prices = generate_synthetic_prices(T=400)
 
-    # Save selected prices for inspection
     prices.to_csv(out / 'prices.csv', index=True)
 
     strategies = ['PV', 'ProbI', 'PredI', 'RI', 'PI']
     results = {}
 
-    # Optional extra actions (set via CLI args)
     do_gross = getattr(main, '_do_gross', False)
     do_trades = getattr(main, '_do_trades', False)
     do_plot = getattr(main, '_do_plot', False)
 
     for strat in strategies:
-        # instantiate a fresh model per strategy to avoid carry-over of online EM trackers
         model = CrudeOilArbitrageHMM()
         try:
-            signals, spread, lambda_history = model.run_backtest(strat, prices)
+            signals, spread, lambda_history, x_hat_history = model.run_backtest(strat, prices)
         except Exception as e:
             import traceback
             traceback.print_exc()
@@ -103,9 +93,7 @@ def main(metrics=False, outdir='artifacts', prices_path=None):
             continue
 
         if metrics:
-            # evaluate_performance needs lambda_vec and lambda_0 set by fit_cointegration
             rets = evaluate_performance(signals, prices, lambda_history)
-            # ensure returns get a datetime index when prices have one
             try:
                 if isinstance(prices.index, pd.DatetimeIndex):
                     rets = pd.Series(rets)
@@ -117,15 +105,13 @@ def main(metrics=False, outdir='artifacts', prices_path=None):
                 rets = pd.Series(rets)
 
             summary = summarize_returns(rets)
-            # add trade-level stats
             trades = sum(1 for i in range(1, len(signals)) if signals[i] != signals[i-1])
             wins = (rets > 0).sum()
             win_rate = int(wins) / len(rets) if len(rets) > 0 else None
             summary.update({'total_trades': int(trades), 'win_rate': win_rate})
 
-            # save daily returns (preserve datetime index when available)
             rets.to_csv(out / f"rets_{strat}.csv", index=True)
-            # save spread and preserve dates if prices index exists
+            
             spread_series = pd.Series(spread)
             try:
                 if isinstance(prices.index, pd.DatetimeIndex) and len(prices.index) >= len(spread_series):
@@ -134,9 +120,28 @@ def main(metrics=False, outdir='artifacts', prices_path=None):
                 pass
             spread_series.to_csv(out / f"spread_{strat}.csv", index=True)
 
-        # If requested, save gross returns and per-trade tables using existing helper scripts
+            # --- NEW DATA EXPORTS ---
+            # Save lambda history
+            lambda_cols = [f'Weight_{i}' for i in range(len(lambda_history[0][0]))] + ['Intercept']
+            lambda_df = pd.DataFrame([np.append(l[0], l[1]) for l in lambda_history], columns=lambda_cols)
+            if isinstance(prices.index, pd.DatetimeIndex) and len(prices.index) >= len(lambda_df):
+                lambda_df.index = prices.index[:len(lambda_df)]
+            lambda_df.to_csv(out / f"lambda_{strat}.csv", index=True)
+            
+            # Save x_hat history
+            xhat_df = pd.DataFrame(x_hat_history, columns=[f'State_{i}' for i in range(len(x_hat_history[0]))])
+            if isinstance(prices.index, pd.DatetimeIndex) and len(prices.index) >= len(xhat_df):
+                xhat_df.index = prices.index[:len(xhat_df)]
+            xhat_df.to_csv(out / f"xhat_{strat}.csv", index=True)
+
+            results[strat] = {'summary': summary}
+            print(f"{strat}: trades={trades}, cum_return={summary['cumulative_return']:.4f}, sharpe={summary['sharpe']:.2f}")
+        else:
+            nonzero = sum(1 for x in signals if x != 0)
+            results[strat] = {'signals_count': int(nonzero)}
+            print(f"{strat}: signals_count={nonzero}")
+
         if do_gross:
-            # compute gross (no fees)
             from scripts.gross_and_trades import compute_returns_no_fees
             rets_gross = compute_returns_no_fees(signals, prices, model.lambda_vec, model.lambda_0)
             rets_gross.to_csv(out / f"rets_gross_{strat}.csv", index=True)
@@ -147,20 +152,10 @@ def main(metrics=False, outdir='artifacts', prices_path=None):
             trades_df.to_csv(out / f"trades_{strat}.csv", index=False)
 
         if do_plot:
-            # defer plotting until after all strategies processed
             pass
 
-            results[strat] = {'summary': summary}
-            print(f"{strat}: trades={trades}, cum_return={summary['cumulative_return']:.4f}, sharpe={summary['sharpe']:.2f}")
-        else:
-            nonzero = sum(1 for x in signals if x != 0)
-            results[strat] = {'signals_count': int(nonzero)}
-            print(f"{strat}: signals_count={nonzero}")
-
-    # write summary
     with open(out / 'metrics_summary.json', 'w') as f:
         json.dump(results, f, indent=2)
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -171,14 +166,13 @@ if __name__ == '__main__':
     parser.add_argument('--save-trades', action='store_true', help='Also extract and save per-trade PnL tables')
     parser.add_argument('--plot', action='store_true', help='Generate plots using artifacts/ files')
     args = parser.parse_args()
-    # Attach flags to main so it can read them without changing its signature
+    
     setattr(main, '_do_gross', args.save_gross)
     setattr(main, '_do_trades', args.save_trades)
     setattr(main, '_do_plot', args.plot)
     main(metrics=args.metrics, outdir=args.outdir, prices_path=args.prices)
 
     if args.plot:
-        # call plotting script after run
         try:
             from scripts.plot_metrics import main as plot_main
             plot_main()

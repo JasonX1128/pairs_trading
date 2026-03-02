@@ -125,59 +125,61 @@ class CrudeOilArbitrageHMM:
     def get_signal(self, strategy, t, spread, x_hat):
         s_curr, s_prev = spread.iloc[t], spread.iloc[t-1]
         q = abs(norm.ppf(self.alpha_bw / 2))
-        
-        # Use a rolling window for historical increments to avoid permanently inflated thresholds
         lookback = min(t, 100) # 100-day rolling window
         
+        signal = 0
+        
         if strategy == 'PV':
-            return -1 if s_curr > 0 else 1
+            if s_curr > 0: signal = -1
+            elif s_curr < 0: signal = 1
             
         elif strategy == 'ProbI':
-            if t < self.n: return 0
-            window = spread.iloc[t-self.n:t]
-            mu, std = np.mean(window), np.std(window)
-            if s_curr > (mu + q * std): return -1
-            if s_curr < (mu - q * std): return 1
+            if t >= self.n:
+                window = spread.iloc[t-self.n:t]
+                mu, std = np.mean(window), np.std(window)
+                if s_curr > (mu + q * std): signal = -1
+                elif s_curr < (mu - q * std): signal = 1
             
         elif strategy == 'PredI':
             e_s = np.dot(x_hat, self.gamma + self.phi * s_prev)
-            # Safeguard: Blend HMM volatility with empirical volatility to prevent infinite bands
             empirical_std = np.std(spread.iloc[t-lookback:t]) if t > 10 else 0
             std_s = min(np.sqrt(np.dot(x_hat, self.eta**2)), empirical_std * 2) 
             
-            if s_curr > (e_s + q * std_s): return -1
-            if s_curr < (e_s - q * std_s): return 1
+            if s_curr > (e_s + q * std_s): signal = -1
+            elif s_curr < (e_s - q * std_s): signal = 1
             
         elif strategy == 'RI':
-            if t < 2: return 0
-            x_t = s_curr - s_prev
-            # Rolling window for percentiles
-            hist_inc = np.abs(spread.iloc[t-lookback+1:t].values - spread.iloc[t-lookback:t-1].values)
-            q_val = np.percentile(hist_inc, 100 * (1 - self.alpha_bw)) if len(hist_inc) > 10 else 999
-            if x_t > q_val: return -1
-            if x_t < -q_val: return 1
+            if t >= 2:
+                x_t = s_curr - s_prev
+                hist_inc = np.abs(spread.iloc[t-lookback+1:t].values - spread.iloc[t-lookback:t-1].values)
+                q_val = np.percentile(hist_inc, 100 * (1 - self.alpha_bw)) if len(hist_inc) > 10 else 999
+                if x_t > q_val: signal = -1
+                elif x_t < -q_val: signal = 1
             
         elif strategy == 'PI':
-            if t < 1: return 0
-            e_next = np.dot(x_hat, self.gamma + self.phi * s_curr)
-            pred_inc = e_next - s_curr
-            # Rolling window for percentiles
-            hist_inc = np.abs(spread.iloc[t-lookback+1:t].values - spread.iloc[t-lookback:t-1].values)
-            q_val = np.percentile(hist_inc, 100 * (1 - self.alpha_bw)) if len(hist_inc) > 10 else 999
+            if t >= 1:
+                e_next = np.dot(x_hat, self.gamma + self.phi * s_curr)
+                pred_inc = e_next - s_curr
+                hist_inc = np.abs(spread.iloc[t-lookback+1:t].values - spread.iloc[t-lookback:t-1].values)
+                q_val = np.percentile(hist_inc, 100 * (1 - self.alpha_bw)) if len(hist_inc) > 10 else 999
+                
+                # FIXED LOGIC: Buy when predicting an increase, sell when predicting a decrease
+                if pred_inc > q_val: signal = 1   
+                elif pred_inc < -q_val: signal = -1 
+        
+        # STRICT WRONG-SIDE FILTER
+        if signal == 1 and s_curr >= 0:
+            return 0
+        if signal == -1 and s_curr <= 0:
+            return 0
             
-            # FIXED LOGIC: Buy when predicting an increase, sell when predicting a decrease
-            if pred_inc > q_val: return 1   
-            if pred_inc < -q_val: return -1 
-            
-        return 0
+        return signal
 
     def run_backtest(self, strategy, df_prices, window_size=100, warmup=20):
         """The main loop: Cointegration -> Initialize -> Filter -> Trade -> M-Step."""
-        # Fit initial cointegration on the first 'window_size' data points to avoid lookahead
         init_prices = df_prices.iloc[:max(window_size, warmup)]
         self.fit_cointegration(init_prices)
         
-        # Initial spread for parameters
         spread_init = pd.Series(np.dot(init_prices, self.lambda_vec) + self.lambda_0, index=init_prices.index)
         self.initialize_params(spread_init)
         
@@ -186,31 +188,27 @@ class CrudeOilArbitrageHMM:
         position = 0
         x_hat = np.array([0.5, 0.5])
         
-        # Trackers
         spread_series = pd.Series(index=df_prices.index, dtype=float)
         spread_series.iloc[0] = np.dot(df_prices.iloc[0], self.lambda_vec) + self.lambda_0
         lambda_history = [(self.lambda_vec.copy(), self.lambda_0)]
+        x_hat_history = [x_hat.copy()]
         
         for t in range(1, T):
-            # Rolling update: re-fit cointegration on the lookback window
             if t >= window_size:
                 self.fit_cointegration(df_prices.iloc[t-window_size:t])
             
-            # Recalculate current spread values using CURRENT rolling lambda
             s_curr = np.dot(df_prices.iloc[t], self.lambda_vec) + self.lambda_0
             s_prev = np.dot(df_prices.iloc[t-1], self.lambda_vec) + self.lambda_0
             
             spread_series.iloc[t] = s_curr
             lambda_history.append((self.lambda_vec.copy(), self.lambda_0))
 
-            # 1. Update Filter (E-Step) using rolling values
             x_hat = self._e_step(s_curr, s_prev, x_hat)
+            x_hat_history.append(x_hat.copy())
             
-            # 2. Update Parameters every m steps (M-Step)
             if t % self.m == 0:
                 self._m_step()
             
-            # 3. Generate Trading Signal (respecting warmup)
             if t > warmup:
                 if position == 0:
                     position = self.get_signal(strategy, t, spread_series, x_hat)
@@ -221,27 +219,20 @@ class CrudeOilArbitrageHMM:
             
             signals.append(position)
             
-        return signals, spread_series, lambda_history
+        return signals, spread_series, lambda_history, x_hat_history
 
 
 def evaluate_performance(signals, prices, lambda_history):
     """Calculates returns per unit of gross notional exposure."""
-    # Transaction costs (bps): Brent 5.8, Shanghai 53.71, WTI 20.24
     costs = np.array([5.80, 53.71, 20.24]) / 10000
     daily_rets = []
     
     for t in range(1, len(signals)):
-        # Use lambda from t-1 to prevent lookahead in PnL calculation
         lambda_vec, lambda_0 = lambda_history[t-1]
         
-        # Gross Exposure G_t-1
         g_t_prev = np.abs(lambda_0) + np.sum(np.abs(lambda_vec) * prices.iloc[t-1])
-        
-        # PnL from price changes
         p_delta = prices.iloc[t] - prices.iloc[t-1]
         pnl = signals[t-1] * np.sum(lambda_vec * p_delta)
-        
-        # Fees on position changes
         fee = np.sum(np.abs(signals[t] - signals[t-1]) * costs * prices.iloc[t] * np.abs(lambda_vec))
         
         daily_rets.append((pnl - fee) / g_t_prev)
