@@ -2,7 +2,7 @@
 """Create visualizations from artifacts produced by the test scripts.
 
 Produces PNG files into `artifacts/figs/`:
-- equity_curve_{strategy}_net.png
+- equity_curve_{strategy}_net.png (Now with S&P 500 benchmark overlay)
 - equity_curve_{strategy}_gross.png
 - daily_hist_{strategy}.png
 - trades_pnl_{strategy}.png
@@ -19,13 +19,46 @@ import matplotlib.ticker as mtick
 import matplotlib.dates as mdates
 import numpy as np
 import seaborn as sns
+import yfinance as yf
 
 ART = Path('artifacts')
 FIGS = ART / 'figs'
 FIGS.mkdir(parents=True, exist_ok=True)
 
 
-def plot_equity(ret_series, outpath, title):
+def get_sp500_benchmark(start_date, end_date):
+    """Robustly fetches S&P 500 index data and calculates cumulative relative returns."""
+    try:
+        # Fetching the S&P 500 Index (ticker: ^GSPC)
+        sp_data = yf.download("^GSPC", start=start_date, end=end_date, progress=False)
+        if sp_data.empty:
+            return pd.Series(dtype=float)
+        
+        # Robust column selection to handle version-specific yfinance formatting
+        if isinstance(sp_data.columns, pd.MultiIndex):
+            # Handle MultiIndex return (Ticker, Price Type)
+            if 'Adj Close' in sp_data.columns.get_level_values(0):
+                series = sp_data['Adj Close'].iloc[:, 0]
+            else:
+                series = sp_data['Close'].iloc[:, 0]
+        else:
+            # Handle standard Index return
+            if 'Adj Close' in sp_data.columns:
+                series = sp_data['Adj Close']
+            else:
+                series = sp_data['Close']
+        
+        # Calculate daily returns and convert to cumulative relative return (%)
+        sp_rets = series.pct_change().fillna(0)
+        sp_cum = (1 + sp_rets).cumprod()
+        sp_rel = (sp_cum / sp_cum.iloc[0] - 1) * 100
+        return sp_rel
+    except Exception as e:
+        print(f"Warning: Failed to retrieve S&P 500 data: {e}")
+        return pd.Series(dtype=float)
+
+
+def plot_equity(ret_series, outpath, title, sp_benchmark=None):
     if ret_series.empty:
         return
 
@@ -33,8 +66,18 @@ def plot_equity(ret_series, outpath, title):
     start = eq.iloc[0] if len(eq) > 0 else 1.0
     rel = (eq / start - 1) * 100
 
-    plt.figure(figsize=(10, 5))
-    sns.lineplot(x=rel.index, y=rel.values, color='#2b83ba')
+    plt.figure(figsize=(10, 6))
+    
+    # Plot Strategy Net Returns
+    plt.plot(rel.index, rel.values, color='#2b83ba', label='Strategy Net Return', linewidth=2)
+    
+    # Overlay S&P 500 Benchmark if available
+    if sp_benchmark is not None and not sp_benchmark.empty:
+        # Align S&P dates to strategy dates for visual consistency
+        sp_aligned = sp_benchmark.reindex(rel.index, method='ffill')
+        plt.plot(sp_aligned.index, sp_aligned.values, color='#d7191c', 
+                 linestyle='--', label='S&P 500 Benchmark', alpha=0.8)
+
     plt.title(title, fontweight='bold')
     plt.ylabel('Cumulative return (%)')
     plt.xlabel('Date')
@@ -45,6 +88,7 @@ def plot_equity(ret_series, outpath, title):
     except Exception:
         pass
     plt.xticks(rotation=45)
+    plt.legend(loc='upper left', frameon=True)
     plt.grid(True, alpha=0.25)
     plt.tight_layout()
     plt.savefig(outpath, dpi=300)
@@ -220,6 +264,21 @@ def main():
 
     strategies = list(metrics.keys())
 
+    # Establish date range for S&P 500 fetch
+    all_dates = []
+    for strat in strategies:
+        net_path = ART / f"rets_{strat}.csv"
+        if net_path.exists():
+            df_temp = pd.read_csv(net_path, index_col=0, parse_dates=True)
+            all_dates.extend(df_temp.index.tolist())
+    
+    sp_benchmark = pd.Series(dtype=float)
+    if all_dates:
+        start_dt = min(all_dates)
+        end_dt = max(all_dates) + pd.Timedelta(days=1)
+        print(f"Fetching S&P 500 Benchmark from {start_dt.date()} to {end_dt.date()}...")
+        sp_benchmark = get_sp500_benchmark(start_dt, end_dt)
+
     for strat in strategies:
         net_path = ART / f"rets_{strat}.csv"
         gross_path = ART / f"rets_gross_{strat}.csv"
@@ -237,7 +296,8 @@ def main():
 
         # Core Plots
         if not net.empty:
-            plot_equity(net, FIGS / f"equity_net_{strat}.png", f"Equity (net) - {strat}")
+            # Passes sp_benchmark for overlay on net equity curve
+            plot_equity(net, FIGS / f"equity_net_{strat}.png", f"Cumulative Net Return vs S&P 500 - {strat}", sp_benchmark=sp_benchmark)
             plot_drawdown(net, FIGS / f"drawdown_{strat}.png", f"Underwater Curve - {strat}")
             plot_hist(net, FIGS / f"daily_hist_{strat}.png", f"Daily returns - {strat}")
             
